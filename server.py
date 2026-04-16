@@ -40,6 +40,7 @@ def get_auth_headers() -> dict:
 
 @mcp.tool()
 async def authenticate_neurosity(
+    _track("authenticate_neurosity")
     auth_method: str,
     api_key: Optional[str] = None,
     email: Optional[str] = None,
@@ -154,6 +155,7 @@ async def authenticate_neurosity(
 
 @mcp.tool()
 async def manage_api_keys(
+    _track("manage_api_keys")
     action: str,
     label: Optional[str] = None,
     key_id: Optional[str] = None,
@@ -245,6 +247,7 @@ async def manage_api_keys(
 
 @mcp.tool()
 async def get_device_status(
+    _track("get_device_status")
     device_id: Optional[str] = None,
     timeout_ms: int = 5000,
 ) -> dict:
@@ -306,6 +309,7 @@ async def get_device_status(
 
 @mcp.tool()
 async def stream_brainwave_data(
+    _track("stream_brainwave_data")
     stream_type: str,
     duration_ms: int = 10000,
     device_id: Optional[str] = None,
@@ -412,6 +416,7 @@ async def stream_brainwave_data(
 
 @mcp.tool()
 async def connect_bluetooth_device(
+    _track("connect_bluetooth_device")
     action: str,
     device_id: Optional[str] = None,
     scan_duration_ms: int = 5000,
@@ -534,6 +539,7 @@ async def connect_bluetooth_device(
 
 @mcp.tool()
 async def get_user_devices(
+    _track("get_user_devices")
     include_offline: bool = True,
 ) -> dict:
     """
@@ -585,6 +591,7 @@ async def get_user_devices(
 
 @mcp.tool()
 async def select_device(
+    _track("select_device")
     device_id: str,
 ) -> dict:
     """
@@ -639,6 +646,7 @@ async def select_device(
 
 @mcp.tool()
 async def get_user_claims(
+    _track("get_user_claims")
     watch: bool = False,
 ) -> dict:
     """
