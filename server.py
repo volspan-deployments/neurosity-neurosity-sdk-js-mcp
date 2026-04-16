@@ -8,646 +8,698 @@ import httpx
 import os
 import asyncio
 import json
-import time
 from typing import Optional
-from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 mcp = FastMCP("Neurosity SDK")
 
-# In-memory session store (simulates SDK state)
-_session = {
-    "authenticated": False,
-    "auth_method": None,
-    "user_id": None,
-    "device_id": None,
-    "api_key": None,
-    "email": None,
-}
-
+NEUROSITY_API_BASE = "https://api.neurosity.co/v1"
 NEUROSITY_API_KEY = os.environ.get("NEUROSITY_API_KEY", "")
-NEUROSITY_BASE_URL = "https://api.neurosity.co"
+
+# In-memory session store
+_session: dict = {}
 
 
-async def _make_request(
-    method: str,
-    path: str,
-    payload: Optional[dict] = None,
-    api_key: Optional[str] = None,
-) -> dict:
-    """Helper to make authenticated HTTP requests to the Neurosity REST API."""
-    key = api_key or _session.get("api_key") or NEUROSITY_API_KEY
-    headers = {
+def get_auth_headers() -> dict:
+    """Build authorization headers from session or env API key."""
+    api_key = _session.get("api_key") or NEUROSITY_API_KEY
+    if api_key:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-Api-Key": api_key,
+        }
+    token = _session.get("token", "")
+    return {
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {key}" if key else "",
     }
-    url = f"{NEUROSITY_BASE_URL}{path}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        if method.upper() == "GET":
-            resp = await client.get(url, headers=headers)
-        elif method.upper() == "POST":
-            resp = await client.post(url, headers=headers, json=payload or {})
-        elif method.upper() == "DELETE":
-            resp = await client.delete(url, headers=headers)
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
-    try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
-    return {"status_code": resp.status_code, "data": data}
 
 
 @mcp.tool()
-async def authenticate_user(
+async def authenticate_neurosity(
     auth_method: str,
+    api_key: Optional[str] = None,
     email: Optional[str] = None,
     password: Optional[str] = None,
-    api_key: Optional[str] = None,
-    device_id: Optional[str] = None,
 ) -> dict:
     """
-    Authenticate with the Neurosity SDK using email/password credentials or an API key.
+    Authenticate with the Neurosity SDK using either email/password credentials or an API key.
     Use this first before accessing any device data or streams.
-    Required before calling any other tools that interact with a headset or user account.
+    Returns session/auth state information.
     """
     global _session
 
-    if auth_method not in ("email", "apiKey"):
-        return {
-            "success": False,
-            "error": "auth_method must be 'email' or 'apiKey'",
-        }
+    if auth_method == "apiKey":
+        key = api_key or NEUROSITY_API_KEY
+        if not key:
+            return {
+                "success": False,
+                "error": "No API key provided. Pass api_key parameter or set NEUROSITY_API_KEY environment variable.",
+            }
+        _session["api_key"] = key
+        _session["auth_method"] = "apiKey"
 
-    if auth_method == "email":
+        # Validate by fetching user info
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                resp = await client.get(
+                    f"{NEUROSITY_API_BASE}/users/me",
+                    headers=get_auth_headers(),
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                    _session["user"] = user_data
+                    return {
+                        "success": True,
+                        "auth_method": "apiKey",
+                        "user": user_data,
+                        "message": "Successfully authenticated with API key.",
+                    }
+                else:
+                    # Store key anyway and return partial success
+                    return {
+                        "success": True,
+                        "auth_method": "apiKey",
+                        "message": "API key stored. Note: Could not verify key against API (status: {}).".format(resp.status_code),
+                        "note": "The Neurosity SDK primarily uses Firebase/RxJS under the hood. REST endpoints may vary.",
+                    }
+            except Exception as e:
+                _session["api_key"] = key
+                return {
+                    "success": True,
+                    "auth_method": "apiKey",
+                    "message": f"API key stored locally. Remote validation failed: {str(e)}",
+                    "note": "The Neurosity SDK uses Firebase real-time database. Direct REST calls may be limited.",
+                }
+
+    elif auth_method == "emailPassword":
         if not email or not password:
             return {
                 "success": False,
-                "error": "email and password are required for email authentication",
+                "error": "Both email and password are required for emailPassword auth method.",
             }
-        # Attempt email/password login via Neurosity REST API
-        result = await _make_request(
-            "POST",
-            "/v2/auth/login",
-            payload={"email": email, "password": password},
-        )
-        if result["status_code"] in (200, 201):
-            data = result["data"]
-            _session.update(
-                {
-                    "authenticated": True,
-                    "auth_method": "email",
-                    "user_id": data.get("uid") or data.get("userId"),
-                    "device_id": device_id,
-                    "api_key": data.get("idToken") or data.get("token"),
-                    "email": email,
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                # Neurosity uses Firebase Auth under the hood
+                firebase_api_key = os.environ.get("FIREBASE_API_KEY", "")
+                if not firebase_api_key:
+                    # Try Neurosity's own auth endpoint
+                    resp = await client.post(
+                        f"{NEUROSITY_API_BASE}/auth/login",
+                        json={"email": email, "password": password},
+                    )
+                else:
+                    resp = await client.post(
+                        f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={firebase_api_key}",
+                        json={
+                            "email": email,
+                            "password": password,
+                            "returnSecureToken": True,
+                        },
+                    )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    token = data.get("idToken") or data.get("token", "")
+                    _session["token"] = token
+                    _session["email"] = email
+                    _session["auth_method"] = "emailPassword"
+                    _session["user"] = data
+                    return {
+                        "success": True,
+                        "auth_method": "emailPassword",
+                        "email": email,
+                        "message": "Successfully authenticated with email/password.",
+                        "user": data,
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Authentication failed with status {resp.status_code}: {resp.text}",
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Authentication request failed: {str(e)}",
                 }
-            )
-            return {
-                "success": True,
-                "auth_method": "email",
-                "user_id": _session["user_id"],
-                "device_id": device_id,
-                "message": "Successfully authenticated with email/password",
-            }
-        else:
-            # Fallback: simulate success for demo when API unavailable
-            _session.update(
-                {
-                    "authenticated": True,
-                    "auth_method": "email",
-                    "user_id": f"user_{email.split('@')[0]}",
-                    "device_id": device_id,
-                    "email": email,
-                }
-            )
-            return {
-                "success": True,
-                "auth_method": "email",
-                "note": "Authenticated in simulation mode (Neurosity REST endpoint may require SDK-level Firebase auth)",
-                "user_id": _session["user_id"],
-                "device_id": device_id,
-                "api_response": result["data"],
-            }
-
-    else:  # apiKey
-        resolved_key = api_key or NEUROSITY_API_KEY
-        if not resolved_key:
-            return {
-                "success": False,
-                "error": "api_key is required for apiKey authentication (or set NEUROSITY_API_KEY env var)",
-            }
-        # Validate key by hitting user info endpoint
-        result = await _make_request(
-            "GET",
-            "/v2/users/me",
-            api_key=resolved_key,
-        )
-        _session.update(
-            {
-                "authenticated": True,
-                "auth_method": "apiKey",
-                "api_key": resolved_key,
-                "device_id": device_id,
-                "user_id": result["data"].get("uid") if result["status_code"] == 200 else None,
-            }
-        )
-        return {
-            "success": True,
-            "auth_method": "apiKey",
-            "api_key_preview": resolved_key[:6] + "..." + resolved_key[-4:] if len(resolved_key) > 10 else "***",
-            "device_id": device_id,
-            "user_info": result["data"] if result["status_code"] == 200 else None,
-            "message": "Authenticated with API key",
-        }
-
-
-@mcp.tool()
-async def get_device_status(device_id: Optional[str] = None) -> dict:
-    """
-    Retrieve the current status of a connected Neurosity headset, including battery level,
-    signal quality, connection state, and whether the device is online.
-    """
-    target_device = device_id or _session.get("device_id")
-
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
-
-    if not target_device:
-        # Try to get first available device
-        devices_result = await get_devices(include_offline=True)
-        devices = devices_result.get("devices", [])
-        if devices:
-            target_device = devices[0].get("deviceId")
-        else:
-            return {"error": "No device_id provided and no devices found on account."}
-
-    result = await _make_request("GET", f"/v2/devices/{target_device}/status")
-
-    if result["status_code"] == 200:
-        data = result["data"]
-        return {
-            "device_id": target_device,
-            "status": data,
-            "online": data.get("online", False),
-            "battery": data.get("battery"),
-            "charging": data.get("charging"),
-            "state": data.get("state"),
-            "signal_quality": data.get("signalQuality"),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
     else:
-        # Simulated status response for demonstration
         return {
-            "device_id": target_device,
-            "simulated": True,
-            "online": True,
-            "battery": 85,
-            "charging": False,
-            "state": "online",
-            "signal_quality": "good",
-            "firmware_version": "16.0.0",
-            "model": "Crown",
-            "timestamp": datetime.utcnow().isoformat(),
-            "note": "Simulated status - real data requires active Neurosity SDK Firebase connection",
-            "api_response": result["data"],
+            "success": False,
+            "error": f"Unknown auth_method '{auth_method}'. Use 'apiKey' or 'emailPassword'.",
         }
-
-
-@mcp.tool()
-async def stream_brainwave_data(
-    metric: str,
-    duration_seconds: int = 10,
-    label: Optional[str] = None,
-) -> dict:
-    """
-    Subscribe to a real-time brainwave or cognitive metric stream from the Neurosity headset.
-    Returns a collection of data samples for the requested metric over the specified duration.
-    """
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
-
-    valid_metrics = [
-        "calm", "focus", "brainwaves", "powerByBand",
-        "kinesis", "awareness", "facialExpression",
-        "accelerometer", "signalQuality",
-    ]
-
-    if metric not in valid_metrics:
-        return {
-            "error": f"Invalid metric '{metric}'. Valid options: {', '.join(valid_metrics)}"
-        }
-
-    device_id = _session.get("device_id")
-    duration_seconds = max(1, min(duration_seconds, 300))  # Clamp 1-300s
-
-    # Build endpoint path
-    path = f"/v2/streams/{metric}"
-    params = {}
-    if device_id:
-        params["deviceId"] = device_id
-    if label and metric == "brainwaves":
-        params["label"] = label
-
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    if query:
-        path = f"{path}?{query}"
-
-    # Attempt real API stream request
-    result = await _make_request("GET", path)
-
-    # Generate simulated data samples for demonstration
-    import random
-    samples = []
-    sample_count = min(duration_seconds * 2, 20)  # ~2 samples/second, max 20
-
-    for i in range(sample_count):
-        ts = time.time() + (i * 0.5)
-        if metric == "calm":
-            samples.append({"probability": round(random.uniform(0.3, 0.9), 4), "timestamp": ts})
-        elif metric == "focus":
-            samples.append({"probability": round(random.uniform(0.4, 0.95), 4), "timestamp": ts})
-        elif metric == "brainwaves":
-            sample = {
-                "label": label or "raw",
-                "data": [round(random.gauss(0, 10), 4) for _ in range(8)],
-                "info": {"samplingRate": 256, "channelNames": ["CP3","C3","F5","PO3","PO4","F6","C4","CP4"]},
-                "timestamp": ts,
-            }
-            samples.append(sample)
-        elif metric == "powerByBand":
-            samples.append({
-                "delta": [round(random.uniform(0.1, 0.5), 4) for _ in range(8)],
-                "theta": [round(random.uniform(0.1, 0.4), 4) for _ in range(8)],
-                "alpha": [round(random.uniform(0.2, 0.6), 4) for _ in range(8)],
-                "beta": [round(random.uniform(0.1, 0.4), 4) for _ in range(8)],
-                "gamma": [round(random.uniform(0.05, 0.2), 4) for _ in range(8)],
-                "timestamp": ts,
-            })
-        elif metric == "kinesis":
-            commands = ["push", "pull", "neutral"]
-            samples.append({
-                "label": random.choice(commands),
-                "confidence": round(random.uniform(0.5, 1.0), 4),
-                "timestamp": ts,
-            })
-        elif metric == "accelerometer":
-            samples.append({
-                "x": round(random.uniform(-1, 1), 4),
-                "y": round(random.uniform(-1, 1), 4),
-                "z": round(random.uniform(-1, 1), 4),
-                "timestamp": ts,
-            })
-        elif metric == "signalQuality":
-            samples.append({
-                "channels": {ch: random.choice(["good", "great", "bad"]) for ch in ["CP3","C3","F5","PO3","PO4","F6","C4","CP4"]},
-                "timestamp": ts,
-            })
-        elif metric == "awareness":
-            samples.append({"probability": round(random.uniform(0.3, 0.8), 4), "timestamp": ts})
-        elif metric == "facialExpression":
-            expressions = ["neutral", "smile", "surprise"]
-            samples.append({
-                "label": random.choice(expressions),
-                "confidence": round(random.uniform(0.6, 1.0), 4),
-                "timestamp": ts,
-            })
-
-    # Compute summary statistics where applicable
-    summary = {}
-    if metric in ("calm", "focus", "awareness") and samples:
-        probs = [s["probability"] for s in samples]
-        summary = {
-            "average": round(sum(probs) / len(probs), 4),
-            "min": round(min(probs), 4),
-            "max": round(max(probs), 4),
-            "interpretation": (
-                "High" if sum(probs)/len(probs) > 0.7 else
-                "Moderate" if sum(probs)/len(probs) > 0.4 else "Low"
-            ),
-        }
-
-    return {
-        "metric": metric,
-        "label": label,
-        "duration_seconds": duration_seconds,
-        "sample_count": len(samples),
-        "samples": samples,
-        "summary": summary,
-        "device_id": device_id,
-        "timestamp": datetime.utcnow().isoformat(),
-        "note": "Data is simulated for demonstration. Real streaming requires active Neurosity SDK Firebase/WebSocket connection.",
-    }
 
 
 @mcp.tool()
 async def manage_api_keys(
     action: str,
-    api_key_id: Optional[str] = None,
     label: Optional[str] = None,
+    key_id: Optional[str] = None,
 ) -> dict:
     """
-    Create, list, or remove API keys for authenticating with the Neurosity SDK programmatically.
+    Create or remove Neurosity API keys for a user account.
+    Creating an API key returns the key value; removing deletes it permanently.
     """
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
-
-    if action not in ("create", "list", "remove"):
-        return {"error": "action must be 'create', 'list', or 'remove'"}
+    headers = get_auth_headers()
 
     if action == "create":
-        result = await _make_request(
-            "POST",
-            "/v2/users/me/apiKeys",
-            payload={
-                "description": label or "API Key",
-                "scopes": {
-                    "read:devices-info": True,
-                    "read:devices-status": True,
-                    "read:focus": True,
-                    "read:calm": True,
-                    "read:brainwaves": True,
-                },
-            },
-        )
-        if result["status_code"] in (200, 201):
-            return {"success": True, "action": "create", "api_key": result["data"]}
-        else:
-            import random, string
-            fake_key = "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
-            return {
-                "success": True,
-                "action": "create",
-                "simulated": True,
-                "api_key": {
-                    "id": f"key_{fake_key[:8]}",
-                    "key": fake_key,
-                    "description": label or "API Key",
-                    "created": datetime.utcnow().isoformat(),
-                },
-                "note": "Simulated key - real key creation requires authenticated Neurosity account with SDK",
-                "api_response": result["data"],
-            }
-
-    elif action == "list":
-        result = await _make_request("GET", "/v2/users/me/apiKeys")
-        if result["status_code"] == 200:
-            return {"success": True, "action": "list", "api_keys": result["data"]}
-        else:
-            return {
-                "success": True,
-                "action": "list",
-                "simulated": True,
-                "api_keys": [
-                    {"id": "key_abc123", "description": "home-automation", "created": "2024-01-01T00:00:00Z"},
-                    {"id": "key_def456", "description": "research-script", "created": "2024-02-15T00:00:00Z"},
-                ],
-                "note": "Simulated list - real data requires authenticated Neurosity account",
-                "api_response": result["data"],
-            }
-
-    else:  # remove
-        if not api_key_id:
-            return {"error": "api_key_id is required when action is 'remove'"}
-        result = await _make_request("DELETE", f"/v2/users/me/apiKeys/{api_key_id}")
-        if result["status_code"] in (200, 204):
-            return {"success": True, "action": "remove", "api_key_id": api_key_id}
-        else:
-            return {
-                "success": True,
-                "action": "remove",
-                "simulated": True,
-                "api_key_id": api_key_id,
-                "message": f"API key '{api_key_id}' removed (simulated)",
-                "api_response": result["data"],
-            }
-
-
-@mcp.tool()
-async def get_devices(include_offline: bool = True) -> dict:
-    """
-    Retrieve a list of all Neurosity headsets associated with the authenticated user account.
-    """
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
-
-    result = await _make_request("GET", "/v2/devices")
-
-    if result["status_code"] == 200:
-        devices = result["data"]
-        if not include_offline:
-            devices = [d for d in devices if d.get("online", False)]
-        return {
-            "success": True,
-            "device_count": len(devices),
-            "devices": devices,
+        payload = {}
+        if label:
+            payload["description"] = label
+            payload["label"] = label
+        # Default scopes matching SDK examples
+        payload["scopes"] = {
+            "read:devices-info": True,
+            "read:devices-status": True,
+            "read:focus": True,
+            "read:calm": True,
+            "read:brainwaves": True,
         }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                resp = await client.post(
+                    f"{NEUROSITY_API_BASE}/users/me/api-keys",
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code in (200, 201):
+                    data = resp.json()
+                    return {
+                        "success": True,
+                        "action": "create",
+                        "api_key": data,
+                        "message": "API key created successfully.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "action": "create",
+                        "error": f"Failed to create API key: {resp.status_code} - {resp.text}",
+                        "note": "Ensure you are authenticated before managing API keys.",
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Request failed: {str(e)}",
+                }
+
+    elif action == "remove":
+        if not key_id:
+            return {
+                "success": False,
+                "error": "key_id is required when action is 'remove'.",
+            }
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                resp = await client.delete(
+                    f"{NEUROSITY_API_BASE}/users/me/api-keys/{key_id}",
+                    headers=headers,
+                )
+                if resp.status_code in (200, 204):
+                    return {
+                        "success": True,
+                        "action": "remove",
+                        "key_id": key_id,
+                        "message": f"API key '{key_id}' removed successfully.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "action": "remove",
+                        "error": f"Failed to remove API key: {resp.status_code} - {resp.text}",
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Request failed: {str(e)}",
+                }
     else:
-        # Simulated device list
-        simulated_devices = [
-            {
-                "deviceId": "crown_abc123",
-                "deviceNickname": "My Crown",
-                "model": "Crown",
-                "online": True,
-                "battery": 85,
-                "firmwareVersion": "16.0.0",
-                "apiVersion": "7.1.0",
-            }
-        ]
-        if include_offline:
-            simulated_devices.append({
-                "deviceId": "crown_xyz789",
-                "deviceNickname": "Office Crown",
-                "model": "Crown",
-                "online": False,
-                "battery": 12,
-                "firmwareVersion": "15.8.0",
-                "apiVersion": "7.0.0",
-            })
         return {
-            "success": True,
-            "simulated": True,
-            "device_count": len(simulated_devices),
-            "devices": simulated_devices,
-            "note": "Simulated device list - real data requires authenticated Neurosity SDK session",
-            "api_response": result["data"],
+            "success": False,
+            "error": f"Unknown action '{action}'. Use 'create' or 'remove'.",
         }
 
 
 @mcp.tool()
-async def connect_bluetooth(
-    device_id: str,
-    transport: str = "bluetooth",
-    timeout_ms: int = 10000,
+async def get_device_status(
+    device_id: Optional[str] = None,
+    timeout_ms: int = 5000,
 ) -> dict:
     """
-    Establish a Bluetooth connection to a nearby Neurosity headset for low-latency local data streaming.
+    Subscribe to and retrieve the current status of a connected Neurosity headset device.
+    Returns device state including battery level, connection state, signal quality, and
+    whether the device is being worn.
     """
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
+    headers = get_auth_headers()
+    timeout_s = min(timeout_ms / 1000, 30)
 
-    if transport not in ("bluetooth", "react-native"):
-        return {"error": "transport must be 'bluetooth' or 'react-native'"}
-
-    # Bluetooth is a local hardware protocol - we simulate the connection attempt
-    # and provide guidance since server-side BLE is not directly possible
-    result = await _make_request(
-        "POST",
-        f"/v2/devices/{device_id}/bluetooth/connect",
-        payload={"transport": transport, "timeoutMs": timeout_ms},
-    )
-
-    if result["status_code"] in (200, 201):
-        _session["device_id"] = device_id
-        return {
-            "success": True,
-            "device_id": device_id,
-            "transport": transport,
-            "connection": result["data"],
-        }
-    else:
-        _session["device_id"] = device_id
-        return {
-            "success": True,
-            "simulated": True,
-            "device_id": device_id,
-            "transport": transport,
-            "timeout_ms": timeout_ms,
-            "status": "connected",
-            "latency_ms": 12,
-            "note": (
-                "Bluetooth connection simulation. Actual BLE connections require the Neurosity SDK "
-                "running in a Node.js or browser environment with hardware BLE support. "
-                "Use the @neurosity/sdk with bluetooth transport for real BLE connections."
-            ),
-            "sdk_usage": (
-                "const neurosity = new Neurosity({ bluetoothTransport: new BluetoothTransport() }); "
-                "await neurosity.bluetooth.connect();"
-            ),
-        }
-
-
-@mcp.tool()
-async def train_mental_command(
-    action: str,
-    training_duration_seconds: int = 8,
-    baseline: bool = False,
-) -> dict:
-    """
-    Record a training session for a Neurosity mental command or kinesis action.
-    Teaches the headset to recognize specific thought patterns associated with user-defined commands.
-    """
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
-
-    device_id = _session.get("device_id")
-    training_duration_seconds = max(1, min(training_duration_seconds, 60))
-
-    payload = {
-        "action": action,
-        "durationSeconds": training_duration_seconds,
-        "baseline": baseline,
-    }
+    # Build URL - use device_id if provided, otherwise use default
     if device_id:
-        payload["deviceId"] = device_id
-
-    result = await _make_request(
-        "POST",
-        "/v2/kinesis/train",
-        payload=payload,
-    )
-
-    if result["status_code"] in (200, 201):
-        return {
-            "success": True,
-            "action": action,
-            "baseline": baseline,
-            "training_result": result["data"],
-        }
+        url = f"{NEUROSITY_API_BASE}/devices/{device_id}/status"
     else:
-        import random
+        url = f"{NEUROSITY_API_BASE}/devices/status"
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "success": True,
+                    "device_id": device_id,
+                    "status": data,
+                    "fields": {
+                        "battery": data.get("battery"),
+                        "state": data.get("state"),
+                        "charging": data.get("charging"),
+                        "sleepMode": data.get("sleepMode"),
+                        "sleepModeReason": data.get("sleepModeReason"),
+                        "connected": data.get("connected") or data.get("state") == "online",
+                    },
+                }
+            elif resp.status_code == 404:
+                return {
+                    "success": False,
+                    "error": "Device not found. Check the device_id or ensure you are authenticated.",
+                    "status_code": 404,
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"Failed to get device status: {resp.status_code} - {resp.text}",
+                    "note": "The Neurosity SDK uses Firebase real-time subscriptions. REST status endpoint availability may vary.",
+                }
+        except httpx.TimeoutException:
+            return {
+                "success": False,
+                "error": f"Request timed out after {timeout_ms}ms. Device may be offline.",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Request failed: {str(e)}",
+            }
+
+
+@mcp.tool()
+async def stream_brainwave_data(
+    stream_type: str,
+    duration_ms: int = 10000,
+    device_id: Optional[str] = None,
+) -> dict:
+    """
+    Subscribe to real-time brainwave or cognitive metric streams from a Neurosity headset.
+    Returns a stream of values over the specified duration.
+    Supported stream types: calm, focus, rawBrainwaves, powerByBand, kinesis,
+    facialExpression, signalQuality, accelerometer, brainwaves.
+    """
+    valid_stream_types = [
+        "calm", "focus", "rawBrainwaves", "powerByBand",
+        "kinesis", "facialExpression", "signalQuality",
+        "accelerometer", "brainwaves",
+    ]
+
+    if stream_type not in valid_stream_types:
         return {
-            "success": True,
-            "simulated": True,
-            "action": action,
-            "baseline": baseline,
-            "training_duration_seconds": training_duration_seconds,
-            "session_id": f"training_{int(time.time())}",
-            "quality_score": round(random.uniform(0.6, 0.95), 3),
-            "samples_recorded": training_duration_seconds * 256,
-            "status": "completed",
-            "message": (
-                f"Training session for '{action}' {'(baseline)' if baseline else ''} recorded successfully."
-            ),
-            "recommendations": [
-                "Complete 3-5 training sessions for best accuracy",
-                "Record a baseline session if not done yet",
-                "Train in a quiet environment with minimal distraction",
-            ],
-            "note": (
-                "Simulated training result. Real training uses the Neurosity SDK kinesis API: "
-                "neurosity.training.record({ label: action, timestamp: Date.now(), duration: 8000 })"
-            ),
-            "api_response": result["data"],
+            "success": False,
+            "error": f"Invalid stream_type '{stream_type}'. Valid options: {', '.join(valid_stream_types)}",
+        }
+
+    headers = get_auth_headers()
+    # Cap duration at 60 seconds for practical purposes
+    duration_s = min(duration_ms / 1000, 60)
+    # Cap at 30s for HTTP timeout
+    timeout_s = min(duration_s + 5, 35)
+
+    # Build URL
+    if device_id:
+        url = f"{NEUROSITY_API_BASE}/devices/{device_id}/streams/{stream_type}"
+    else:
+        url = f"{NEUROSITY_API_BASE}/streams/{stream_type}"
+
+    collected_data = []
+    start_time = asyncio.get_event_loop().time()
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        try:
+            # Try SSE/streaming endpoint first
+            async with client.stream(
+                "GET",
+                url,
+                headers={**headers, "Accept": "text/event-stream"},
+            ) as response:
+                if response.status_code == 200:
+                    async for line in response.aiter_lines():
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        if elapsed >= duration_s:
+                            break
+                        if line.startswith("data:"):
+                            raw = line[5:].strip()
+                            if raw and raw != "[DONE]":
+                                try:
+                                    parsed = json.loads(raw)
+                                    collected_data.append(parsed)
+                                except json.JSONDecodeError:
+                                    collected_data.append({"raw": raw})
+
+                    return {
+                        "success": True,
+                        "stream_type": stream_type,
+                        "device_id": device_id,
+                        "duration_ms": duration_ms,
+                        "sample_count": len(collected_data),
+                        "data": collected_data[:100],  # limit to 100 samples
+                        "message": f"Streamed {len(collected_data)} samples over {duration_s:.1f}s.",
+                    }
+                else:
+                    # Fallback: try a single snapshot endpoint
+                    snap_url = url.replace("/streams/", "/data/")
+                    snap_resp = await client.get(snap_url, headers=headers)
+                    if snap_resp.status_code == 200:
+                        data = snap_resp.json()
+                        return {
+                            "success": True,
+                            "stream_type": stream_type,
+                            "device_id": device_id,
+                            "data": data if isinstance(data, list) else [data],
+                            "sample_count": 1,
+                            "message": "Returned snapshot (streaming not available).",
+                        }
+                    return {
+                        "success": False,
+                        "error": f"Stream endpoint returned {response.status_code}.",
+                        "note": "The Neurosity SDK uses Firebase real-time subscriptions via RxJS. Direct HTTP streaming endpoints may not be available without the official JS SDK.",
+                        "recommendation": "Use the official Neurosity JS/TS SDK for real-time streaming: neurosity.calm().subscribe(...)",
+                    }
+        except httpx.TimeoutException:
+            return {
+                "success": False,
+                "error": f"Stream timed out after {timeout_s}s.",
+                "partial_data": collected_data,
+                "sample_count": len(collected_data),
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Streaming failed: {str(e)}",
+                "note": "The Neurosity SDK is primarily TypeScript/RxJS. REST streaming support is limited.",
+                "recommendation": "Consider using the official @neurosity/sdk npm package for full streaming capabilities.",
+            }
+
+
+@mcp.tool()
+async def connect_bluetooth_device(
+    action: str,
+    device_id: Optional[str] = None,
+    scan_duration_ms: int = 5000,
+) -> dict:
+    """
+    Discover and connect to a Neurosity headset via Bluetooth.
+    Actions: 'scan' to discover nearby devices, 'connect' to connect, 'disconnect' to disconnect.
+    Note: Bluetooth (BLE) functionality requires the local Neurosity JS SDK and cannot be
+    performed over HTTP. This tool returns guidance and simulated responses.
+    """
+    headers = get_auth_headers()
+
+    if action == "scan":
+        # BLE scanning is a browser/Node API - not available via HTTP REST
+        # We can try to get known devices from the API as a proxy
+        async with httpx.AsyncClient(timeout=scan_duration_ms / 1000 + 5) as client:
+            try:
+                resp = await client.get(
+                    f"{NEUROSITY_API_BASE}/devices",
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    devices = resp.json()
+                    bluetooth_devices = [
+                        d for d in (devices if isinstance(devices, list) else [devices])
+                        if d.get("bluetooth") or d.get("type") == "crown"
+                    ]
+                    return {
+                        "success": True,
+                        "action": "scan",
+                        "scan_duration_ms": scan_duration_ms,
+                        "devices_found": bluetooth_devices or devices,
+                        "message": f"Found {len(bluetooth_devices or devices)} device(s). Note: True BLE scanning requires the local JS SDK.",
+                        "note": "Full BLE scanning requires running the @neurosity/sdk in a Node.js or browser environment with Bluetooth access.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "action": "scan",
+                        "error": f"Could not fetch devices: {resp.status_code}",
+                        "note": "BLE scanning requires local hardware access. Use the JS SDK for Bluetooth operations.",
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "action": "scan",
+                    "error": f"Scan failed: {str(e)}",
+                    "note": "Bluetooth scanning requires the @neurosity/sdk running locally with BLE hardware access.",
+                }
+
+    elif action == "connect":
+        if not device_id:
+            return {
+                "success": False,
+                "error": "device_id is required when action is 'connect'.",
+            }
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                resp = await client.post(
+                    f"{NEUROSITY_API_BASE}/devices/{device_id}/bluetooth/connect",
+                    headers=headers,
+                    json={"deviceId": device_id},
+                )
+                if resp.status_code in (200, 201):
+                    return {
+                        "success": True,
+                        "action": "connect",
+                        "device_id": device_id,
+                        "data": resp.json(),
+                        "message": f"Bluetooth connection initiated for device {device_id}.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "action": "connect",
+                        "device_id": device_id,
+                        "error": f"Connect request returned {resp.status_code}: {resp.text}",
+                        "note": "BLE connect may require the local JS SDK. Remote BLE control is limited.",
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Connect failed: {str(e)}",
+                    "note": "Bluetooth operations require local hardware and the @neurosity/sdk JS package.",
+                }
+
+    elif action == "disconnect":
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                url = (
+                    f"{NEUROSITY_API_BASE}/devices/{device_id}/bluetooth/disconnect"
+                    if device_id
+                    else f"{NEUROSITY_API_BASE}/devices/bluetooth/disconnect"
+                )
+                resp = await client.post(url, headers=headers, json={})
+                if resp.status_code in (200, 204):
+                    return {
+                        "success": True,
+                        "action": "disconnect",
+                        "device_id": device_id,
+                        "message": "Bluetooth device disconnected.",
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "action": "disconnect",
+                        "error": f"Disconnect returned {resp.status_code}: {resp.text}",
+                    }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Disconnect failed: {str(e)}",
+                }
+    else:
+        return {
+            "success": False,
+            "error": f"Unknown action '{action}'. Use 'scan', 'connect', or 'disconnect'.",
         }
 
 
 @mcp.tool()
-async def get_user_info(include_claims: bool = False) -> dict:
+async def get_user_devices(
+    include_offline: bool = True,
+) -> dict:
     """
-    Retrieve the authenticated user's account information including profile details,
-    subscription status, and user claims.
+    Retrieve the list of Neurosity devices associated with the authenticated user account.
+    Returns device metadata like model name, firmware version, and device IDs.
     """
-    if not _session.get("authenticated"):
-        return {"error": "Not authenticated. Please call authenticate_user first."}
+    headers = get_auth_headers()
 
-    result = await _make_request("GET", "/v2/users/me")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(
+                f"{NEUROSITY_API_BASE}/devices",
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                devices = resp.json()
+                if not isinstance(devices, list):
+                    devices = [devices] if devices else []
 
-    if result["status_code"] == 200:
-        user_data = result["data"]
-        response = {
-            "success": True,
-            "user": user_data,
-            "authenticated": True,
-            "auth_method": _session.get("auth_method"),
-        }
-        if include_claims:
-            claims_result = await _make_request("GET", "/v2/users/me/claims")
-            response["claims"] = claims_result["data"] if claims_result["status_code"] == 200 else None
-        return response
-    else:
-        simulated_user = {
-            "uid": _session.get("user_id") or "user_abc123",
-            "email": _session.get("email") or "user@example.com",
-            "displayName": "Neurosity User",
-            "emailVerified": True,
-            "subscription": {
-                "plan": "pro",
-                "status": "active",
-                "features": ["brainwaves", "focus", "calm", "kinesis", "bluetooth"],
-            },
-            "createdAt": "2023-06-01T00:00:00Z",
-        }
-        response = {
-            "success": True,
-            "simulated": True,
-            "user": simulated_user,
-            "authenticated": True,
-            "auth_method": _session.get("auth_method"),
-            "note": "Simulated user info - real data requires authenticated Neurosity SDK session",
-            "api_response": result["data"],
-        }
-        if include_claims:
-            response["claims"] = {
-                "read:devices-info": True,
-                "read:devices-status": True,
-                "read:focus": True,
-                "read:calm": True,
-                "read:brainwaves": True,
-                "write:kinesis-training": True,
-                "admin": False,
+                if not include_offline:
+                    devices = [
+                        d for d in devices
+                        if d.get("state") == "online" or d.get("online") is True
+                    ]
+
+                return {
+                    "success": True,
+                    "device_count": len(devices),
+                    "devices": devices,
+                    "include_offline": include_offline,
+                }
+            elif resp.status_code == 401:
+                return {
+                    "success": False,
+                    "error": "Unauthorized. Please authenticate first using authenticate_neurosity.",
+                    "status_code": 401,
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"Failed to fetch devices: {resp.status_code} - {resp.text}",
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Request failed: {str(e)}",
             }
-        return response
+
+
+@mcp.tool()
+async def select_device(
+    device_id: str,
+) -> dict:
+    """
+    Select a specific Neurosity device to use for subsequent data streaming and status operations.
+    Must be called after authentication. Stores the selected device ID in the session.
+    """
+    global _session
+    headers = get_auth_headers()
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            # Verify the device exists
+            resp = await client.get(
+                f"{NEUROSITY_API_BASE}/devices/{device_id}",
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                device_data = resp.json()
+                _session["selected_device_id"] = device_id
+                _session["selected_device"] = device_data
+                return {
+                    "success": True,
+                    "device_id": device_id,
+                    "device": device_data,
+                    "message": f"Device '{device_id}' selected as active device.",
+                }
+            elif resp.status_code == 404:
+                return {
+                    "success": False,
+                    "error": f"Device '{device_id}' not found. Use get_user_devices to see available devices.",
+                    "status_code": 404,
+                }
+            else:
+                # Store device_id anyway even if we can't verify
+                _session["selected_device_id"] = device_id
+                return {
+                    "success": True,
+                    "device_id": device_id,
+                    "message": f"Device '{device_id}' stored as selected device (could not verify: {resp.status_code}).",
+                    "warning": "Device verification failed. The device ID has been stored but may not be valid.",
+                }
+        except Exception as e:
+            # Still store the device_id
+            _session["selected_device_id"] = device_id
+            return {
+                "success": True,
+                "device_id": device_id,
+                "message": f"Device '{device_id}' stored as selected device.",
+                "warning": f"Could not verify device with API: {str(e)}",
+            }
+
+
+@mcp.tool()
+async def get_user_claims(
+    watch: bool = False,
+) -> dict:
+    """
+    Retrieve the current authenticated user's claims and permissions,
+    including subscription tier, device access rights, and feature flags.
+    """
+    headers = get_auth_headers()
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            # Try user claims endpoint
+            resp = await client.get(
+                f"{NEUROSITY_API_BASE}/users/me/claims",
+                headers=headers,
+            )
+
+            if resp.status_code == 200:
+                claims_data = resp.json()
+                return {
+                    "success": True,
+                    "claims": claims_data,
+                    "watching": watch,
+                    "message": "User claims retrieved successfully."
+                    + (" Note: Real-time watching requires the JS SDK RxJS subscription." if watch else ""),
+                }
+            elif resp.status_code == 404:
+                # Try alternate endpoint
+                resp2 = await client.get(
+                    f"{NEUROSITY_API_BASE}/users/me",
+                    headers=headers,
+                )
+                if resp2.status_code == 200:
+                    user_data = resp2.json()
+                    return {
+                        "success": True,
+                        "claims": user_data.get("claims", user_data),
+                        "user": user_data,
+                        "watching": watch,
+                        "message": "Retrieved user data (claims endpoint not available, returned user profile).",
+                    }
+                return {
+                    "success": False,
+                    "error": f"Claims endpoint not found (404). User data also unavailable ({resp2.status_code}).",
+                }
+            elif resp.status_code == 401:
+                return {
+                    "success": False,
+                    "error": "Unauthorized. Please authenticate first using authenticate_neurosity.",
+                    "status_code": 401,
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"Failed to fetch claims: {resp.status_code} - {resp.text}",
+                    "note": "The Neurosity SDK exposes claims via Firebase custom tokens. REST access may be limited.",
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Request failed: {str(e)}",
+            }
 
 
 
